@@ -61,10 +61,9 @@ jobs:
           echo "VKD3D_VERSION=$(cat VERSION 2>/dev/null || echo '3.0')" >> $GITHUB_ENV
           echo "VKD3D_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Build x64
+      - name: Build
         run: |
           cd vkd3d-proton
-          
           ./package-release.sh master build --no-package
 
       - name: Package for Winlator
@@ -74,17 +73,14 @@ jobs:
           
           BUILD_DIR=$(find build -maxdepth 1 -type d -name "vkd3d-proton-*" | head -1)
           
-          mkdir -p package/system32
-          mkdir -p package/syswow64
+          mkdir -p winlator_package
           
-          cp "$BUILD_DIR/x64/d3d12.dll" package/system32/
-          cp "$BUILD_DIR/x64/d3d12core.dll" package/system32/
-          cp "$BUILD_DIR/x86/d3d12.dll" package/syswow64/
-          cp "$BUILD_DIR/x86/d3d12core.dll" package/syswow64/
+          mv "$BUILD_DIR/x64" winlator_package/system32
+          mv "$BUILD_DIR/x86" winlator_package/syswow64
           
           VERSION_CODE="$((RANDOM % 3))"
           
-          cat > package/profile.json << EOF
+          cat > winlator_package/profile.json << EOF
           {
             "type": "VKD3D",
             "versionName": "${VKD3D_VERSION}-${VKD3D_SHA}",
@@ -113,8 +109,8 @@ jobs:
           
           ARCHIVE_NAME="vkd3d-proton-${VKD3D_VERSION}-${VKD3D_SHA}.wcp"
           
-          cd package && zip -9 "../$ARCHIVE_NAME" -r ./*
-          mv "../$ARCHIVE_NAME" ../../
+          cd winlator_package
+          zip -9 -r "../../$ARCHIVE_NAME" .
           
           echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
 
