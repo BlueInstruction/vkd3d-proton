@@ -69,7 +69,11 @@ jobs:
       - name: Setup Build Environment
         run: |
           echo "=== Setting up build environment ==="
+          
+          # Enable 32-bit architecture
+          sudo dpkg --add-architecture i386
           sudo apt-get update
+          
           sudo apt-get install -y \
             git \
             meson \
@@ -89,15 +93,13 @@ jobs:
             g++-mingw-w64-x86-64 \
             g++-mingw-w64-i686 \
             mingw-w64 \
-            mingw-w64-tools \
-            wine64 \
-            wine32
+            mingw-w64-tools
           
           # Set MinGW to use POSIX threads for better compatibility
-          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix || true
-          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix || true
-          sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix || true
-          sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix || true
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix 2>/dev/null || true
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix 2>/dev/null || true
+          sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix 2>/dev/null || true
+          sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix 2>/dev/null || true
           
           echo "Build environment ready"
 
