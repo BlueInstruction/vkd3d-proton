@@ -1,0 +1,63 @@
+name: DXGI-Proxy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 zip
+
+      - name: Build
+        run: |
+          mkdir -p build/x64 build/x86
+          
+          # x64
+          x86_64-w64-mingw32-gcc -shared -o build/x64/dxgi.dll proxy/src/dxgi_proxy.c proxy/src/dxgi.def \
+            -O2 -s -static -Wl,--enable-stdcall-fixup -mno-avx -mno-avx2 -msse4.2
+          
+          x86_64-w64-mingw32-gcc -shared -o build/x64/d3d12.dll proxy/src/dxgi_proxy.c proxy/src/d3d12.def \
+            -O2 -s -static -Wl,--enable-stdcall-fixup -mno-avx -mno-avx2 -msse4.2
+          
+          # x86
+          i686-w64-mingw32-gcc -shared -o build/x86/dxgi.dll proxy/src/dxgi_proxy.c proxy/src/dxgi.def \
+            -O2 -s -static -Wl,--enable-stdcall-fixup -mno-avx -mno-avx2 -msse4.2
+          
+          i686-w64-mingw32-gcc -shared -o build/x86/d3d12.dll proxy/src/dxgi_proxy.c proxy/src/d3d12.def \
+            -O2 -s -static -Wl,--enable-stdcall-fixup -mno-avx -mno-avx2 -msse4.2
+
+      - name: Package
+        run: |
+          cp configs/dxgi_proxy.ini build/
+          cd build && zip -r ../dragon-proxy.zip . && cd ..
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dragon-proxy
+          path: dragon-proxy.zip
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: proxy-v1.0
+          name: "Dragon Proxy v1.0"
+          files: dragon-proxy.zip
+          body: "DXGI/D3D12 Proxy - Fixes UE5.5.4 on ARM"
+        env:
+          GH_TOKEN: ${{ github.token }}
