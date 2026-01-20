@@ -304,23 +304,14 @@ jobs:
           # MEMORY ALLOCATION PATCHES
           # ============================================================
           mem = [
-              # Increase default heap sizes
               (r'(VKD3D_VA_BLOCK_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(1ull << 30)'),
               (r'(VKD3D_VA_SLAB_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(1ull << 26)'),
               (r'(VKD3D_MEMORY_CHUNK_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(256 * 1024 * 1024)'),
-              
-              # Buffer size limits
               (r'(VKD3D_MAX_BUFFER_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(2ull << 30)'),
-              (r'(max_buffer_size\s*=\s*)[^;,\n]+', r'\g<1>(2ull << 30)'),
-              
-              # Descriptor heap sizes
               (r'(VKD3D_MAX_DESCRIPTOR_COUNT\s*=\s*)[^;,\n]+', r'\g<1>1000000'),
-              (r'(max_descriptor_count\s*=\s*)[^;,\n]+', r'\g<1>1000000'),
-              
-              # Sampler limits
               (r'(VKD3D_MAX_SAMPLER_COUNT\s*=\s*)[^;,\n]+', r'\g<1>4096'),
           ]
-          
+ 
           for f in glob.glob("libs/vkd3d/*.c", recursive=False) + glob.glob("libs/vkd3d/*.h", recursive=False):
               patch_file(f, mem)
 
