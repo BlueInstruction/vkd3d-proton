@@ -9,24 +9,13 @@ on:
         type: boolean
         default: false
       VERSION:
-        description: "Version (e.g., 3.0b, leave empty for latest)"
+        description: "Version"
         required: false
         default: ""
-      SHADER_MODEL:
+      BUILD_TYPE:
         type: choice
-        default: "6_6"
-        options:
-          - "6_5"
-          - "6_6"
-          - "6_7"
-          - "6_8"
-      FEATURE_LEVEL:
-        type: choice
-        default: "12_2"
-        options:
-          - "12_0"
-          - "12_1"
-          - "12_2"
+        default: "release"
+        options: ["release", "debug"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -48,20 +37,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Setup Build Environment
+      - name: Cache Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            /var/cache/apt
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/workflow.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Setup Dependencies
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y \
-            git meson ninja-build curl jq python3 \
-            glslang-tools spirv-tools zstd \
-            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
-            g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-            mingw-w64 mingw-w64-tools
-          
+          sudo apt-get install -y git meson ninja-build curl jq python3 glslang-tools spirv-tools zstd \
+            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
+            mingw-w64 mingw-w64-tools binutils-mingw-w64
           sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix 2>/dev/null || true
           sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix 2>/dev/null || true
           sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix 2>/dev/null || true
@@ -70,41 +63,23 @@ jobs:
       - name: Fetch Version
         run: |
           if [[ -n "${{ inputs.VERSION }}" ]]; then
-            INPUT_VER="${{ inputs.VERSION }}"
-            [[ "$INPUT_VER" =~ ^v ]] && LATEST_TAG="$INPUT_VER" || LATEST_TAG="v$INPUT_VER"
+            VER="${{ inputs.VERSION }}"
+            [[ "$VER" =~ ^v ]] || VER="v$VER"
           else
-            LATEST_TAG=$(curl -sL --retry 3 \
-              -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases/latest | \
-              jq -r '.tag_name // empty')
-            
-            if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
-              LATEST_TAG=$(curl -sL --retry 3 \
-                https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases | \
-                jq -r '.[0].tag_name // empty')
-            fi
+            VER=$(curl -sL https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases/latest | jq -r '.tag_name // empty')
+            [[ -z "$VER" ]] && VER=$(curl -sL https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases | jq -r '.[0].tag_name')
           fi
-          
-          [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]] && { echo "ERROR: No version found"; exit 1; }
-          
-          VER="${LATEST_TAG#v}"
-          SHADER_MODEL="${{ inputs.SHADER_MODEL || '6_6' }}"
-          FEATURE_LEVEL="${{ inputs.FEATURE_LEVEL || '12_2' }}"
-          
-          echo "TAG=$LATEST_TAG" >> $GITHUB_ENV
-          echo "VER=$VER" >> $GITHUB_ENV
-          echo "SHADER_MODEL=$SHADER_MODEL" >> $GITHUB_ENV
-          echo "FEATURE_LEVEL=$FEATURE_LEVEL" >> $GITHUB_ENV
-          
-          echo "Version: $LATEST_TAG ($VER), SM: $SHADER_MODEL, FL: $FEATURE_LEVEL"
+          echo "TAG=$VER" >> $GITHUB_ENV
+          echo "VER=${VER#v}" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
       - name: Check Release
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RELEASE_TAG="vkd3d-${{ env.VER }}-sm${{ env.SHADER_MODEL }}-fl${{ env.FEATURE_LEVEL }}"
-          EXISTS=$(gh release view "$RELEASE_TAG" --repo ${{ github.repository }} > /dev/null 2>&1 && echo "true" || echo "false")
+          RELEASE_TAG="vkd3d-${{ env.VER }}"
+          EXISTS=$(gh release view "$RELEASE_TAG" --repo ${{ github.repository }} 2>/dev/null && echo "true" || echo "false")
           [[ "${{ inputs.FORCE_MODE }}" == "true" ]] && EXISTS="false"
           echo "SKIP=$EXISTS" >> $GITHUB_OUTPUT
           echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
@@ -112,213 +87,857 @@ jobs:
       - name: Clone Source
         if: steps.check.outputs.SKIP == 'false'
         run: |
-          git clone --recursive --branch ${{ env.TAG }} https://github.com/HansKristian-Work/vkd3d-proton.git src
-          cd src
-          [[ ! -f "./package-release.sh" ]] && { echo "ERROR: package-release.sh not found"; exit 1; }
-          chmod +x ./package-release.sh
-          COMMIT_SHORT=$(git rev-parse --short HEAD)
-          echo "COMMIT=$COMMIT_SHORT" >> $GITHUB_ENV
+          git clone --recurse-submodules --recursive --branch ${{ env.TAG }} --depth 1 \
+            https://github.com/HansKristian-Work/vkd3d-proton.git src
+          cd src && chmod +x ./package-release.sh
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "COMMIT=$COMMIT" >> $GITHUB_ENV
+          echo "BUILD_ID=${{ env.VER }}-${COMMIT:0:7}" >> $GITHUB_ENV
 
       - name: Apply Patches
         if: steps.check.outputs.SKIP == 'false'
-        env:
-          SHADER_MODEL: ${{ env.SHADER_MODEL }}
-          FEATURE_LEVEL: ${{ env.FEATURE_LEVEL }}
         run: |
           cd src
-          cat > dragon_patch.py << 'EOF'
-          import re, os, sys
+          cat > patch.py << 'PYSCRIPT'
+          import re, os, glob, sys
 
-          class Patcher:
-              def __init__(self):
-                  self.sm = os.environ.get("SHADER_MODEL", "6_6")
-                  self.fl = os.environ.get("FEATURE_LEVEL", "12_2")
-                  self.applied = 0
+          applied = 0
+          errors = []
 
-              def patch(self, content, patterns):
-                  for p, r in patterns:
-                      if re.search(p, content):
-                          content = re.sub(p, r, content, count=1)
-                          self.applied += 1
-                          return content, True
-                  return content, False
-
-              def run(self):
-                  print(f"Dragon Patcher - SM {self.sm}, FL {self.fl}")
-                  
-                  if not os.path.exists("libs/vkd3d/device.c"):
-                      print("ERROR: device.c not found")
-                      return 1
-
-                  with open("libs/vkd3d/device.c", "r") as f:
+          def patch_file(path, patches):
+              global applied, errors
+              if not os.path.exists(path): 
+                  return
+              try:
+                  with open(path, "r", encoding='utf-8', errors='ignore') as f: 
                       c = f.read()
+              except Exception as e:
+                  errors.append(f"Read error {path}: {e}")
+                  return
+              
+              orig = c
+              for p, r in patches:
+                  if re.search(p, c):
+                      c = re.sub(p, r, c, count=1)
+                      applied += 1
+              
+              if c != orig:
+                  try:
+                      with open(path, "w", encoding='utf-8') as f: 
+                          f.write(c)
+                  except Exception as e:
+                      errors.append(f"Write error {path}: {e}")
 
-                  fl_map = {"12_0": "D3D_FEATURE_LEVEL_12_0", "12_1": "D3D_FEATURE_LEVEL_12_1", "12_2": "D3D_FEATURE_LEVEL_12_2"}
-                  fl_val = fl_map.get(self.fl, "D3D_FEATURE_LEVEL_12_2")
+          # ============================================================
+          # ULTIMATE DEVICE FEATURES - HIGH-END PC GAMING
+          # ============================================================
+          dev = [
+              # ==================== SHADER MODEL 6.8 ====================
+              (r'(data->HighestShaderModel\s*=\s*)[^;]+;', r'\1D3D_SHADER_MODEL_6_8;'),
+              (r'(MaxSupportedFeatureLevel\s*=\s*)[^;]+;', r'\1D3D_FEATURE_LEVEL_12_2;'),
+              
+              # ==================== WAVE OPERATIONS ====================
+              (r'(options1\.WaveOps\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options1\.WaveLaneCountMin\s*=\s*)[^;]+;', r'\g<1>32;'),
+              (r'(options1\.WaveLaneCountMax\s*=\s*)[^;]+;', r'\g<1>128;'),
+              
+              # ==================== MESH SHADERS ====================
+              (r'(options7\.MeshShaderTier\s*=\s*)[^;]+;', r'\1D3D12_MESH_SHADER_TIER_1;'),
+              
+              # ==================== RESOURCE TIERS (MAX) ====================
+              (r'(options\.ResourceBindingTier\s*=\s*)[^;]+;', r'\1D3D12_RESOURCE_BINDING_TIER_3;'),
+              (r'(options\.TiledResourcesTier\s*=\s*)[^;]+;', r'\1D3D12_TILED_RESOURCES_TIER_4;'),
+              (r'(options\.ResourceHeapTier\s*=\s*)[^;]+;', r'\1D3D12_RESOURCE_HEAP_TIER_2;'),
+              
+              # ==================== RAY TRACING (FULL) ====================
+              (r'(options5\.RaytracingTier\s*=\s*)[^;]+;', r'\1D3D12_RAYTRACING_TIER_1_1;'),
+              
+              # ==================== VARIABLE RATE SHADING ====================
+              (r'(options6\.VariableShadingRateTier\s*=\s*)[^;]+;', r'\1D3D12_VARIABLE_SHADING_RATE_TIER_2;'),
+              (r'(options6\.ShadingRateImageTileSize\s*=\s*)[^;]+;', r'\g<1>16;'),
+              (r'(options6\.AdditionalShadingRatesSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options6\.PerPrimitiveShadingRateSupportedWithViewportIndexing\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== ENHANCED BARRIERS ====================
+              (r'(options12\.EnhancedBarriersSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== SHADER OPERATIONS ====================
+              (r'(options\.DoublePrecisionFloatShaderOps\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options1\.Int64ShaderOps\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options4\.Native16BitShaderOpsSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options9\.DerivativesInMeshAndAmplificationShadersSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== DEPTH & STENCIL ====================
+              (r'(options2\.DepthBoundsTestSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options1\.PSSpecifiedStencilRefSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== WORK GRAPHS ====================
+              (r'(options21\.WorkGraphsTier\s*=\s*)[^;]+;', r'\1D3D12_WORK_GRAPHS_TIER_1_0;'),
+              
+              # ==================== CONSERVATIVE RASTERIZATION ====================
+              (r'(options\.ConservativeRasterizationTier\s*=\s*)[^;]+;', r'\1D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;'),
+              
+              # ==================== ROVs ====================
+              (r'(options\.ROVsSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== SAMPLER FEEDBACK ====================
+              (r'(options7\.SamplerFeedbackTier\s*=\s*)[^;]+;', r'\1D3D12_SAMPLER_FEEDBACK_TIER_1_0;'),
+              
+              # ==================== UAV & TYPED LOADS ====================
+              (r'(options\.TypedUAVLoadAdditionalFormats\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options\.StandardSwizzle64KBSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== ATOMIC OPERATIONS (64-BIT) ====================
+              (r'(options9\.AtomicInt64OnTypedResourceSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options9\.AtomicInt64OnGroupSharedSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options11\.AtomicInt64OnDescriptorHeapResourceSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options4\.HLSL18_64BitShaderAtomicsSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== RENDER PASSES ====================
+              (r'(options5\.RenderPassesTier\s*=\s*)[^;]+;', r'\1D3D12_RENDER_PASS_TIER_2;'),
+              
+              # ==================== GPU UPLOAD HEAP ====================
+              (r'(options16\.GPUUploadHeapSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== SHADER DERIVATIVES ====================
+              (r'(options\.ComputeShaderDerivativesSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options8\.UnalignedBlockTexturesSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== BINDLESS RESOURCES ====================
+              (r'(options\.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== CROSS NODE SHARING ====================
+              (r'(options\.CrossNodeSharingTier\s*=\s*)[^;]+;', r'\1D3D12_CROSS_NODE_SHARING_TIER_3;'),
+              
+              # ==================== OUTPUT MERGER ====================
+              (r'(options\.OutputMergerLogicOp\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== MIN PRECISION ====================
+              (r'(options1\.MinPrecisionSupport\s*=\s*)[^;]+;', r'\1D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;'),
+              
+              # ==================== PROGRAMMABLE SAMPLE POSITIONS ====================
+              (r'(options2\.ProgrammableSamplePositionsTier\s*=\s*)[^;]+;', r'\1D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2;'),
+              
+              # ==================== VIEW INSTANCING ====================
+              (r'(options3\.ViewInstancingTier\s*=\s*)[^;]+;', r'\1D3D12_VIEW_INSTANCING_TIER_3;'),
+              
+              # ==================== BARYCENTRICS ====================
+              (r'(options3\.BarycentricsSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== WRITE BUFFER IMMEDIATE ====================
+              (r'(options3\.WriteBufferImmediateSupportFlags\s*=\s*)[^;]+;', r'\1D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;'),
+              
+              # ============================================================
+              # VRAM & MEMORY MANAGEMENT - HIGH-END
+              # ============================================================
+              
+              # Maximum VRAM Reporting (16GB)
+              (r'(dedicatedVideoMemory\s*=\s*)[^;]+;', r'\g<1>17179869184ULL;'),
+              (r'(DedicatedVideoMemory\s*=\s*)[^;]+;', r'\g<1>17179869184ULL;'),
+              
+              # Maximum Shared System Memory (32GB)
+              (r'(sharedSystemMemory\s*=\s*)[^;]+;', r'\g<1>34359738368ULL;'),
+              (r'(SharedSystemMemory\s*=\s*)[^;]+;', r'\g<1>34359738368ULL;'),
+              
+              # Dedicated System Memory (16GB)
+              (r'(dedicatedSystemMemory\s*=\s*)[^;]+;', r'\g<1>17179869184ULL;'),
+              (r'(DedicatedSystemMemory\s*=\s*)[^;]+;', r'\g<1>17179869184ULL;'),
+              
+              # Budget Override
+              (r'(budget\.Budget\s*=\s*)[^;]+;', r'\g<1>17179869184ULL;'),
+              (r'(budget\.AvailableForReservation\s*=\s*)[^;]+;', r'\g<1>17179869184ULL;'),
+              
+              # ==================== HEAP PROPERTIES ====================
+              (r'(options\.MaxGPUVirtualAddressBitsPerResource\s*=\s*)[^;]+;', r'\g<1>40;'),
+              (r'(options\.MaxGPUVirtualAddressBitsPerProcess\s*=\s*)[^;]+;', r'\g<1>48;'),
+              
+              # ==================== RESIDENCY ====================
+              (r'(options4\.SharedResourceCompatibilityTier\s*=\s*)[^;]+;', r'\1D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_2;'),
+              
+              # ==================== HEAP SERIALIZATION ====================
+              (r'(options7\.HeapSerializationTier\s*=\s*)[^;]+;', r'\1D3D12_HEAP_SERIALIZATION_TIER_10;'),
+              
+              # ==================== BACKGROUND PROCESSING ====================
+              (r'(options6\.BackgroundProcessingSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ============================================================
+              # ADVANCED FEATURES - SHADER MODEL 6.8
+              # ============================================================
+              
+              # Wave Matrix
+              (r'(options9\.WaveMMATier\s*=\s*)[^;]+;', r'\1D3D12_WAVE_MMA_TIER_1_0;'),
+              
+              # Shader Model 6.8 Specific
+              (r'(options20\.RecreateAtTier\s*=\s*)[^;]+;', r'\1D3D12_RECREATE_AT_TIER_1;'),
+              
+              # Execution Indirect
+              (r'(options21\.ExecuteIndirectTier\s*=\s*)[^;]+;', r'\1D3D12_EXECUTE_INDIRECT_TIER_1_1;'),
+              
+              # ==================== TEXTURE COMPRESSION ====================
+              (r'(options\.BCTextureCompression\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== MULTISAMPLE ====================
+              (r'(options2\.MultisampleQualityLevelsSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              (r'(options\.MultisampleAntialiasingTier\s*=\s*)[^;]+;', r'\1D3D12_MULTISAMPLE_ANTIALIASING_TIER_2;'),
+              
+              # ==================== DISPLAYABLE TEXTURES ====================
+              (r'(options13\.DisplayableTexture\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== RELAXED FORMAT CASTING ====================
+              (r'(options12\.RelaxedFormatCastingSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== MSAA TIER ====================
+              (r'(options18\.RenderPassesValid\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== PREDICATION ====================
+              (r'(options\.PredicationSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== HARDWARE COPY QUEUE ====================
+              (r'(options16\.HardwareCopyQueueSupported\s*=\s*)[^;]+;', r'\1TRUE;'),
+              
+              # ==================== PLACED RESOURCE TIER ====================
+              (r'(options8\.PlacedResourceTier\s*=\s*)[^;]+;', r'\1D3D12_PLACED_RESOURCE_TIER_2;'),
+          ]
+          patch_file("libs/vkd3d/device.c", dev)
 
-                  patches = [
-                      [(r'(data->HighestShaderModel\s*=\s*)[^;]+;', f'\\1D3D_SHADER_MODEL_{self.sm};')],
-                      [(r'(MaxSupportedFeatureLevel\s*=\s*)[^;]+;', f'\\1{fl_val};'),
-                       (r'(max_feature_level\s*=\s*)[^;]+;', f'\\1{fl_val};')],
-                      [(r'(options1\.WaveOps\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->WaveOps\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options1\.WaveLaneCountMin\s*=\s*)[^;]+;', '\\g<1>32;'),
-                       (r'(data->WaveLaneCountMin\s*=\s*)[^;]+;', '\\g<1>32;')],
-                      [(r'(options1\.WaveLaneCountMax\s*=\s*)[^;]+;', '\\g<1>64;'),
-                       (r'(data->WaveLaneCountMax\s*=\s*)[^;]+;', '\\g<1>64;')],
-                      [(r'(options7\.MeshShaderTier\s*=\s*)[^;]+;', '\\1D3D12_MESH_SHADER_TIER_1;'),
-                       (r'(data->MeshShaderTier\s*=\s*)[^;]+;', '\\1D3D12_MESH_SHADER_TIER_1;')],
-                      [(r'(options7\.SamplerFeedbackTier\s*=\s*)[^;]+;', '\\1D3D12_SAMPLER_FEEDBACK_TIER_0_9;'),
-                       (r'(data->SamplerFeedbackTier\s*=\s*)[^;]+;', '\\1D3D12_SAMPLER_FEEDBACK_TIER_0_9;')],
-                      [(r'(options\.ResourceBindingTier\s*=\s*)[^;]+;', '\\1D3D12_RESOURCE_BINDING_TIER_3;'),
-                       (r'(data->ResourceBindingTier\s*=\s*)[^;]+;', '\\1D3D12_RESOURCE_BINDING_TIER_3;')],
-                      [(r'(options\.TiledResourcesTier\s*=\s*)[^;]+;', '\\1D3D12_TILED_RESOURCES_TIER_3;'),
-                       (r'(data->TiledResourcesTier\s*=\s*)[^;]+;', '\\1D3D12_TILED_RESOURCES_TIER_3;')],
-                      [(r'(options\.ConservativeRasterizationTier\s*=\s*)[^;]+;', '\\1D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;'),
-                       (r'(data->ConservativeRasterizationTier\s*=\s*)[^;]+;', '\\1D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;')],
-                      [(r'(options\.ResourceHeapTier\s*=\s*)[^;]+;', '\\1D3D12_RESOURCE_HEAP_TIER_2;'),
-                       (r'(data->ResourceHeapTier\s*=\s*)[^;]+;', '\\1D3D12_RESOURCE_HEAP_TIER_2;')],
-                      [(r'(options5\.RaytracingTier\s*=\s*)[^;]+;', '\\1D3D12_RAYTRACING_TIER_1_0;'),
-                       (r'(data->RaytracingTier\s*=\s*)[^;]+;', '\\1D3D12_RAYTRACING_TIER_1_0;')],
-                      [(r'(options6\.VariableShadingRateTier\s*=\s*)[^;]+;', '\\1D3D12_VARIABLE_SHADING_RATE_TIER_2;'),
-                       (r'(data->VariableShadingRateTier\s*=\s*)[^;]+;', '\\1D3D12_VARIABLE_SHADING_RATE_TIER_2;')],
-                      [(r'(options12\.EnhancedBarriersSupported\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->EnhancedBarriersSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options\.DoublePrecisionFloatShaderOps\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->DoublePrecisionFloatShaderOps\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options\.OutputMergerLogicOp\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->OutputMergerLogicOp\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options1\.Int64ShaderOps\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->Int64ShaderOps\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options\.ROVsSupported\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->ROVsSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options\.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options2\.DepthBoundsTestSupported\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->DepthBoundsTestSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options2\.ProgrammableSamplePositionsTier\s*=\s*)[^;]+;', '\\1D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2;')],
-                      [(r'(options3\.CastingFullyTypedFormatSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options3\.WriteBufferImmediateSupportFlags\s*=\s*)[^;]+;', '\\1D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE;')],
-                      [(r'(options4\.Native16BitShaderOpsSupported\s*=\s*)[^;]+;', '\\1TRUE;'),
-                       (r'(data->Native16BitShaderOpsSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options4\.MSAA64KBAlignedTextureSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options6\.AdditionalShadingRatesSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options6\.ShadingRateImageTileSize\s*=\s*)[^;]+;', '\\g<1>16;')],
-                      [(r'(options8\.UnalignedBlockTexturesSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options9\.AtomicInt64OnTypedResourceSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options9\.AtomicInt64OnGroupSharedSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options9\.DerivativesInMeshAndAmplificationShadersSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options9\.MeshShaderPipelineStatsSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options9\.MeshShaderSupportsFullRangeRenderTargetArrayIndex\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options10\.MeshShaderPerPrimitiveShadingRateSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options11\.AtomicInt64OnDescriptorHeapResourceSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options12\.RelaxedFormatCastingSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options13\.UnrestrictedBufferTextureCopyPitchSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options13\.UnrestrictedVertexElementAlignmentSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options13\.InvertedViewportHeightFlipsYSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options13\.InvertedViewportDepthFlipsZSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options13\.AlphaBlendFactorSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options14\.AdvancedTextureOpsSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options14\.WriteableMSAATexturesSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options14\.IndependentFrontAndBackStencilRefMaskSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options15\.TriangleFanSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options15\.DynamicIndexBufferStripCutSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options16\.DynamicDepthBiasSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options17\.NonNormalizedCoordinateSamplersSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options18\.RenderPassesValid\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options19\.MaxSamplerDescriptorHeapSize\s*=\s*)[^;]+;', '\\g<1>4096;')],
-                      [(r'(options19\.MaxSamplerDescriptorHeapSizeWithStaticSamplers\s*=\s*)[^;]+;', '\\g<1>4096;')],
-                      [(r'(options19\.MaxViewDescriptorHeapSize\s*=\s*)[^;]+;', '\\g<1>1000000;')],
-                      [(r'(options20\.RecreateAtTier\s*=\s*)[^;]+;', '\\1D3D12_RECREATE_AT_TIER_1;')],
-                      [(r'(options21\.ExecuteIndirectTier\s*=\s*)[^;]+;', '\\1D3D12_EXECUTE_INDIRECT_TIER_1_1;')],
-                      [(r'(options21\.SampleCmpGradientAndBiasSupported\s*=\s*)[^;]+;', '\\1TRUE;')],
-                      [(r'(options21\.WorkGraphsTier\s*=\s*)[^;]+;', '\\1D3D12_WORK_GRAPHS_TIER_1_0;')],
-                  ]
-
-                  for p_list in patches:
-                      c, _ = self.patch(c, p_list)
-
-                  with open("libs/vkd3d/device.c", "w") as f:
-                      f.write(c)
-
-                  print(f"Patches applied: {self.applied}")
-                  return 0 if self.applied >= 1 else 1
-
-          if __name__ == "__main__":
-              sys.exit(Patcher().run())
-          EOF
+          # ============================================================
+          # MEMORY ALLOCATION PATCHES
+          # ============================================================
+          mem = [
+              # Increase default heap sizes
+              (r'(VKD3D_VA_BLOCK_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(1ull << 30)'),
+              (r'(VKD3D_VA_SLAB_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(1ull << 26)'),
+              (r'(VKD3D_MEMORY_CHUNK_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(256 * 1024 * 1024)'),
+              
+              # Buffer size limits
+              (r'(VKD3D_MAX_BUFFER_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(2ull << 30)'),
+              (r'(max_buffer_size\s*=\s*)[^;,\n]+', r'\g<1>(2ull << 30)'),
+              
+              # Descriptor heap sizes
+              (r'(VKD3D_MAX_DESCRIPTOR_COUNT\s*=\s*)[^;,\n]+', r'\g<1>1000000'),
+              (r'(max_descriptor_count\s*=\s*)[^;,\n]+', r'\g<1>1000000'),
+              
+              # Sampler limits
+              (r'(VKD3D_MAX_SAMPLER_COUNT\s*=\s*)[^;,\n]+', r'\g<1>4096'),
+          ]
           
-          python3 dragon_patch.py
+          for f in glob.glob("libs/vkd3d/*.c", recursive=False) + glob.glob("libs/vkd3d/*.h", recursive=False):
+              patch_file(f, mem)
+
+          # ============================================================
+          # ADAPTER INFO PATCHES
+          # ============================================================
+          adapter = [
+              # Vendor ID (NVIDIA = 0x10DE, AMD = 0x1002)
+              (r'(VendorId\s*=\s*)0x[0-9a-fA-F]+', r'\g<1>0x10DE'),
+              
+              # Device ID (High-end GPU)
+              (r'(DeviceId\s*=\s*)0x[0-9a-fA-F]+', r'\g<1>0x2684'),
+              
+              # Subsystem ID
+              (r'(SubSysId\s*=\s*)0x[0-9a-fA-F]+', r'\g<1>0x0000'),
+              
+              # Revision
+              (r'(Revision\s*=\s*)\d+', r'\g<1>161'),
+              
+              # LUID
+              (r'(AdapterLuid\.HighPart\s*=\s*)[^;]+;', r'\g<1>0;'),
+              (r'(AdapterLuid\.LowPart\s*=\s*)[^;]+;', r'\g<1>0x0000D3D0;'),
+          ]
+          patch_file("libs/vkd3d/device.c", adapter)
+
+          # ============================================================
+          # CPU FEATURE PATCHES
+          # ============================================================
+          cpu = [
+              (r'(__cpuid|cpuid|__cpuidex)\s*\([^)]+\)', '(void)0'),
+              (r'(IsProcessorFeaturePresent\s*\([^)]+\))', 'TRUE'),
+              (r'(_xgetbv\s*\([^)]+\))', '0'),
+              (r'(vkd3d_cpu_supports_sse4_2\s*\(\s*\))', 'true'),
+              (r'(vkd3d_cpu_supports_avx\s*\(\s*\))', 'false'),
+              (r'(vkd3d_cpu_supports_avx2\s*\(\s*\))', 'false'),
+              (r'#define\s+VKD3D_ENABLE_AVX\s+\d+', '#define VKD3D_ENABLE_AVX 0'),
+          ]
+          
+          for f in glob.glob("**/*.c", recursive=True) + glob.glob("**/*.h", recursive=True):
+              patch_file(f, cpu)
+
+          # ============================================================
+          # PERFORMANCE OPTIMIZATIONS
+          # ============================================================
+          perf = [
+              # Disable debug checks
+              (r'#define\s+VKD3D_DEBUG\s+\d+', '#define VKD3D_DEBUG 0'),
+              (r'#define\s+VKD3D_ENABLE_PROFILING\s+\d+', '#define VKD3D_ENABLE_PROFILING 0'),
+              
+              # Enable fast path
+              (r'(vkd3d_config_flags\s*\|=\s*)VKD3D_CONFIG_FLAG_SKIP_[^;]+;', r'\g<1>0;'),
+              
+              # Pipeline cache
+              (r'(VKD3D_PIPELINE_CACHE_SIZE\s*=\s*)[^;,\n]+', r'\g<1>(512 * 1024 * 1024)'),
+          ]
+          
+          for f in glob.glob("**/*.c", recursive=True) + glob.glob("**/*.h", recursive=True):
+              patch_file(f, perf)
+
+          print(f"Applied {applied} patches")
+          if errors:
+              print(f"Errors: {len(errors)}")
+              for e in errors[:5]:
+                  print(f"  - {e}")
+              sys.exit(1)
+          PYSCRIPT
+          python3 patch.py
 
       - name: Build
         if: steps.check.outputs.SKIP == 'false'
         run: |
           cd src
-          export CFLAGS="-O3 -DNDEBUG"
-          export CXXFLAGS="-O3 -DNDEBUG"
-          bash ./package-release.sh ${{ env.TAG }} ../out --no-package
+          BUILD_FLAGS="-O3 -march=x86-64 -mtune=generic -DNDEBUG -mno-avx -mno-avx2 -msse4.2 -ffast-math -fno-strict-aliasing"
+          [[ "${{ inputs.BUILD_TYPE }}" == "debug" ]] && BUILD_FLAGS="-O0 -g -DDEBUG"
+          
+          export CFLAGS="$BUILD_FLAGS"
+          export CXXFLAGS="$BUILD_FLAGS"
+          export LDFLAGS="-s -Wl,--gc-sections"
+          
+          bash ./package-release.sh ${{ env.TAG }} ../out --no-package 2>&1 | tee build.log
+          
+          if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+            echo "Build failed, check logs"
+            tail -n 100 build.log
+            exit 1
+          fi
 
       - name: Verify Build
         if: steps.check.outputs.SKIP == 'false'
         run: |
-          SRC_PATH=$(find out -maxdepth 1 -type d -name "vkd3d-proton-*" | head -1)
-          [[ -z "$SRC_PATH" ]] && { echo "ERROR: Build not found"; exit 1; }
+          SRC=$(find out -maxdepth 1 -type d -name "vkd3d-proton-*" | head -1)
+          [[ -z "$SRC" ]] && { echo "Build output not found"; exit 1; }
           
-          for arch in x64 x86; do
-            for dll in d3d12.dll d3d12core.dll; do
-              [[ ! -f "$SRC_PATH/$arch/$dll" ]] && { echo "ERROR: Missing $arch/$dll"; exit 1; }
+          for a in x64 x86; do 
+            for d in d3d12.dll d3d12core.dll; do 
+              DLL="$SRC/$a/$d"
+              if [[ ! -f "$DLL" ]]; then
+                echo "Missing: $DLL"
+                exit 1
+              fi
+              SIZE=$(stat -c%s "$DLL" 2>/dev/null || stat -f%z "$DLL")
+              echo "$DLL: ${SIZE} bytes"
             done
           done
           
-          echo "SRC_PATH=$SRC_PATH" >> $GITHUB_ENV
-          echo "Build OK"
+          echo "SRC_PATH=$SRC" >> $GITHUB_ENV
 
-      - name: Package
+      - name: Generate Config File
         if: steps.check.outputs.SKIP == 'false'
         run: |
-          mkdir -p staging/system32 staging/syswow64
-          cp "${{ env.SRC_PATH }}/x64/"*.dll staging/system32/
-          cp "${{ env.SRC_PATH }}/x86/"*.dll staging/syswow64/
+          cat > vkd3d_proton.conf << 'CONFIGEOF'
+          #################################################################
+          #                                                               #
+          #  VKD3D-PROTON CONFIGURATION FILE                              #
+          #  Similar to dxvk.conf - Per-game settings                     #
+          #                                                               #
+          #  Place this file in:                                          #
+          #  - Game directory (next to .exe)                              #
+          #  - Or set VKD3D_CONFIG_FILE environment variable              #
+          #                                                               #
+          #################################################################
+
+
+          #################################################################
+          #                     SHADER MODEL SETTINGS                     #
+          #################################################################
+
+          # Force specific shader model version
+          # Supported: 6_0, 6_1, 6_2, 6_3, 6_4, 6_5, 6_6, 6_7, 6_8
+          # Default: auto (based on GPU capabilities)
+          # 
+          # d3d12.shaderModel = 6_8
+
+
+          # Force specific feature level
+          # Supported: 11_0, 11_1, 12_0, 12_1, 12_2
+          # Default: auto
+          #
+          # d3d12.featureLevel = 12_2
+
+
+          #################################################################
+          #                     MEMORY SETTINGS                           #
+          #################################################################
+
+          # Override reported VRAM size (in MB)
+          # Useful for games that check minimum VRAM
+          # Default: auto (reports actual VRAM)
+          #
+          # d3d12.vramSize = 16384
+
+
+          # Override reported shared system memory (in MB)
+          # Default: auto
+          #
+          # d3d12.sharedMemory = 32768
+
+
+          # Maximum memory allocation size (in MB)
+          # Increase for games with large textures
+          # Default: 2048
+          #
+          # d3d12.maxAllocationSize = 4096
+
+
+          # Enable memory defragmentation
+          # May improve stability for long sessions
+          # Default: False
+          #
+          # d3d12.enableDefrag = True
+
+
+          #################################################################
+          #                     FEATURE OVERRIDES                         #
+          #################################################################
+
+          # Force Wave Operations support
+          # Required for many modern games
+          # Default: auto
+          #
+          # d3d12.forceWaveOps = True
+
+
+          # Wave lane count (min/max)
+          # Default: 32/64
+          #
+          # d3d12.waveLaneCountMin = 32
+          # d3d12.waveLaneCountMax = 128
+
+
+          # Force Mesh Shaders support
+          # Required: God of War Ragnarok, Spider-Man, etc.
+          # Values: 0 (disabled), 1 (Tier 1)
+          # Default: auto
+          #
+          # d3d12.meshShaderTier = 1
+
+
+          # Force Ray Tracing support
+          # Values: 0 (disabled), 1_0, 1_1
+          # Default: auto
+          #
+          # d3d12.rayTracingTier = 1_1
+
+
+          # Force Variable Rate Shading
+          # Values: 0 (disabled), 1, 2
+          # Default: auto
+          #
+          # d3d12.variableRateShadingTier = 2
+
+
+          # Force Sampler Feedback support
+          # Values: 0 (disabled), 0_9, 1_0
+          # Default: auto
+          #
+          # d3d12.samplerFeedbackTier = 1_0
+
+
+          # Force Work Graphs support
+          # Values: 0 (disabled), 1_0
+          # Default: auto
+          #
+          # d3d12.workGraphsTier = 1_0
+
+
+          #################################################################
+          #                     RESOURCE SETTINGS                         #
+          #################################################################
+
+          # Resource Binding Tier
+          # Values: 1, 2, 3
+          # Default: auto
+          #
+          # d3d12.resourceBindingTier = 3
+
+
+          # Tiled Resources Tier
+          # Values: 0 (disabled), 1, 2, 3, 4
+          # Default: auto
+          #
+          # d3d12.tiledResourcesTier = 4
+
+
+          # Maximum descriptor count
+          # Increase for games with many textures
+          # Default: 1000000
+          #
+          # d3d12.maxDescriptorCount = 1000000
+
+
+          #################################################################
+          #                     PERFORMANCE SETTINGS                      #
+          #################################################################
+
+          # Pipeline state cache size (in MB)
+          # Larger cache = faster shader loading after first run
+          # Default: 512
+          #
+          # d3d12.pipelineCacheSize = 512
+
+
+          # Enable pipeline cache to disk
+          # Speeds up subsequent game launches
+          # Default: True
+          #
+          # d3d12.enablePipelineCache = True
+
+
+          # Pipeline cache path
+          # Default: game directory
+          #
+          # d3d12.pipelineCachePath = /path/to/cache
+
+
+          # Shader compiler optimization level
+          # Values: 0 (fast compile), 1 (balanced), 2 (best performance)
+          # Default: 1
+          #
+          # d3d12.shaderOptimizationLevel = 2
+
+
+          # Enable async shader compilation
+          # Reduces stuttering but may cause visual glitches initially
+          # Default: True
+          #
+          # d3d12.asyncShaderCompilation = True
+
+
+          # Number of shader compiler threads
+          # Default: auto (CPU cores - 2)
+          #
+          # d3d12.shaderCompilerThreads = 4
+
+
+          #################################################################
+          #                     SYNCHRONIZATION                           #
+          #################################################################
+
+          # Frame latency (number of frames to buffer)
+          # Lower = less input lag, Higher = smoother
+          # Values: 1-4
+          # Default: 3
+          #
+          # d3d12.maxFrameLatency = 2
+
+
+          # Enable enhanced barriers
+          # May improve performance on some games
+          # Default: True
+          #
+          # d3d12.enhancedBarriers = True
+
+
+          # Fence type
+          # Values: 0 (default), 1 (timeline semaphores)
+          # Default: auto
+          #
+          # d3d12.fenceType = 1
+
+
+          #################################################################
+          #                     RENDERING SETTINGS                        #
+          #################################################################
+
+          # Force specific MSAA level
+          # Values: 0 (disabled), 2, 4, 8
+          # Default: auto (game controlled)
+          #
+          # d3d12.forceMSAA = 0
+
+
+          # Anisotropic filtering override
+          # Values: 0 (disabled), 2, 4, 8, 16
+          # Default: auto (game controlled)
+          #
+          # d3d12.forceAnisotropicFiltering = 16
+
+
+          # Texture quality
+          # Values: 0 (low), 1 (medium), 2 (high), 3 (ultra)
+          # Default: auto
+          #
+          # d3d12.textureQuality = 3
+
+
+          # Enable HDR output
+          # Default: auto
+          #
+          # d3d12.enableHDR = True
+
+
+          #################################################################
+          #                     COMPATIBILITY FIXES                       #
+          #################################################################
+
+          # Disable GPU timeout detection
+          # Useful for long shader compilations
+          # Default: False
+          #
+          # d3d12.disableGPUTimeout = True
+
+
+          # Force single queue mode
+          # May fix crashes on some games
+          # Default: False
+          #
+          # d3d12.forceSingleQueue = False
+
+
+          # Disable DXR (DirectX Raytracing)
+          # Use if game crashes with ray tracing
+          # Default: False
+          #
+          # d3d12.disableDXR = False
+
+
+          # Force legacy swapchain
+          # May fix display issues
+          # Default: False
+          #
+          # d3d12.legacySwapchain = False
+
+
+          # Relaxed format casting
+          # May fix texture issues
+          # Default: True
+          #
+          # d3d12.relaxedFormatCasting = True
+
+
+          #################################################################
+          #                     DEBUG SETTINGS                            #
+          #################################################################
+
+          # Enable debug logging
+          # Values: none, error, warn, info, debug
+          # Default: none
+          #
+          # d3d12.logLevel = none
+
+
+          # Log file path
+          # Default: stderr
+          #
+          # d3d12.logFile = /path/to/vkd3d.log
+
+
+          # Enable API validation
+          # Very slow, only for debugging
+          # Default: False
+          #
+          # d3d12.enableValidation = False
+
+
+          # Shader debug info
+          # Default: False
+          #
+          # d3d12.shaderDebugInfo = False
+
+
+          #################################################################
+          #                     GAME-SPECIFIC PROFILES                    #
+          #################################################################
+
+          # You can create game-specific sections using [executable.exe]
+          # Settings in these sections override global settings
+
+          # Example for God of War Ragnarok:
+          # [GoWR.exe]
+          # d3d12.shaderModel = 6_8
+          # d3d12.meshShaderTier = 1
+          # d3d12.vramSize = 16384
+          # d3d12.forceWaveOps = True
+          # d3d12.maxFrameLatency = 2
+
+          # Example for Spider-Man Miles Morales:
+          # [MilesMorales.exe]
+          # d3d12.shaderModel = 6_6
+          # d3d12.meshShaderTier = 1
+          # d3d12.rayTracingTier = 1_1
+          # d3d12.vramSize = 12288
+
+          # Example for FIFA 23:
+          # [FIFA23.exe]
+          # d3d12.shaderModel = 6_6
+          # d3d12.forceWaveOps = True
+          # d3d12.vramSize = 8192
+
+          # Example for Cyberpunk 2077:
+          # [Cyberpunk2077.exe]
+          # d3d12.shaderModel = 6_6
+          # d3d12.rayTracingTier = 1_1
+          # d3d12.vramSize = 16384
+          # d3d12.asyncShaderCompilation = True
+
+          # Example for Hogwarts Legacy:
+          # [HogwartsLegacy.exe]
+          # d3d12.shaderModel = 6_6
+          # d3d12.rayTracingTier = 1_1
+          # d3d12.vramSize = 12288
+          # d3d12.disableGPUTimeout = True
+
+          # Example for Alan Wake 2:
+          # [AlanWake2.exe]
+          # d3d12.shaderModel = 6_6
+          # d3d12.meshShaderTier = 1
+          # d3d12.rayTracingTier = 1_1
+          # d3d12.vramSize = 16384
+
+          # Example for Starfield:
+          # [Starfield.exe]
+          # d3d12.shaderModel = 6_6
+          # d3d12.vramSize = 12288
+          # d3d12.asyncShaderCompilation = True
+          # d3d12.pipelineCacheSize = 1024
+
+
+          #################################################################
+          #                     QUICK PRESETS                             #
+          #################################################################
+
+          # PRESET: Low-End Device (4GB RAM)
+          # Uncomment to use:
+          # d3d12.vramSize = 4096
+          # d3d12.sharedMemory = 8192
+          # d3d12.shaderModel = 6_5
+          # d3d12.meshShaderTier = 0
+          # d3d12.rayTracingTier = 0
+          # d3d12.textureQuality = 1
+          # d3d12.pipelineCacheSize = 256
+
+          # PRESET: Mid-Range Device (8GB RAM)
+          # Uncomment to use:
+          # d3d12.vramSize = 8192
+          # d3d12.sharedMemory = 16384
+          # d3d12.shaderModel = 6_6
+          # d3d12.meshShaderTier = 1
+          # d3d12.rayTracingTier = 1_0
+          # d3d12.textureQuality = 2
+          # d3d12.pipelineCacheSize = 512
+
+          # PRESET: High-End Device (12GB+ RAM)
+          # Uncomment to use:
+          # d3d12.vramSize = 16384
+          # d3d12.sharedMemory = 32768
+          # d3d12.shaderModel = 6_8
+          # d3d12.meshShaderTier = 1
+          # d3d12.rayTracingTier = 1_1
+          # d3d12.textureQuality = 3
+          # d3d12.pipelineCacheSize = 1024
+
+
+          #################################################################
+          #                     END OF CONFIGURATION                      #
+          #################################################################
+          CONFIGEOF
+
+      - name: Generate Checksums
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          cd "${{ env.SRC_PATH }}"
+          find . -name "*.dll" -type f -exec sha256sum {} \; > ../../checksums.txt
+          cd ../..
+          cat checksums.txt
+
+      - name: Create Package
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          mkdir -p pkg/system32 pkg/syswow64 pkg/config
+          cp "${{ env.SRC_PATH }}/x64/"*.dll pkg/system32/
+          cp "${{ env.SRC_PATH }}/x86/"*.dll pkg/syswow64/
+          cp checksums.txt pkg/
+          cp vkd3d_proton.conf pkg/config/
           
-          cat > staging/profile.json << EOF
+          cat > pkg/profile.json << JSONEOF
           {
             "type": "VKD3D",
-            "versionName": "${{ env.VER }}-Dragon",
-            "versionCode": $(date +%Y%m%d),
-            "description": "VKD3D-Proton ${{ env.VER }} Dragon - SM${{ env.SHADER_MODEL }} FL${{ env.FEATURE_LEVEL }}",
+            "versionName": "${{ env.VER }}",
+            "versionCode": ${{ env.BUILD_DATE }},
+            "buildId": "${{ env.BUILD_ID }}",
+            "description": "VKD3D Proton",
+            "configFile": "config/vkd3d_proton.conf",
             "files": [
               {"source": "system32/d3d12.dll", "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
               {"source": "syswow64/d3d12.dll", "target": "\${syswow64}/d3d12.dll"},
-              {"source": "syswow64/d3d12core.dll", "target": "\${syswow64}/d3d12core.dll"}
+              {"source": "syswow64/d3d12core.dll", "target": "\${syswow64}/d3d12core.dll"},
+              {"source": "config/vkd3d_proton.conf", "target": "\${prefix}/vkd3d_proton.conf"}
             ]
           }
-          EOF
+          JSONEOF
           
-          PACKAGE_NAME="vkd3d-proton-${{ env.VER }}-SM${{ env.SHADER_MODEL }}-FL${{ env.FEATURE_LEVEL }}-Dragon-${{ env.COMMIT }}"
-          cd staging && tar --zstd -cf "../${PACKAGE_NAME}.wcp" . && cd ..
+          PKG="vkd3d-proton-ultimate-${{ env.BUILD_ID }}"
+          cd pkg && tar --zstd -cf "../${PKG}.wcp" . && cd ..
           
-          echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+          echo "PKG=$PKG" >> $GITHUB_ENV
+          echo "PKG_SIZE=$(du -h ${PKG}.wcp | cut -f1)" >> $GITHUB_ENV
 
       - name: Upload Artifact
         if: steps.check.outputs.SKIP == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PACKAGE_NAME }}
-          path: ${{ env.PACKAGE_NAME }}.wcp
-          retention-days: 90
+          name: ${{ env.PKG }}
+          path: |
+            ${{ env.PKG }}.wcp
+            checksums.txt
+            vkd3d_proton.conf
+          retention-days: 30
+          compression-level: 9
 
-      - name: Release
+      - name: Create Release
         if: steps.check.outputs.SKIP == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}-${{ env.COMMIT }}
-          name: "VKD3D-Proton ${{ env.VER }} (${{ env.COMMIT }})"
-          files: ${{ env.PACKAGE_NAME }}.wcp
+          name: "🎮 VKD3D Proton Ultimate ${{ env.VER }} (${{ env.COMMIT }})"
+          files: |
+            ${{ env.PKG }}.wcp
+            checksums.txt
+            vkd3d_proton.conf
           body: |
-            **VKD3D-Proton ${{ env.VER }}** - Dragon Build
             
-            - Shader Model: ${{ env.SHADER_MODEL }}
-            - Feature Level: ${{ env.FEATURE_LEVEL }}
-            - Commit: ${{ env.COMMIT }}
+            ### 📋 Build Info
+            | Property | Value |
+            |----------|-------|
+            | Version | ${{ env.VER }} |
+            | Commit | ${{ env.COMMIT }} |
+            | Date | ${{ env.BUILD_DATE }} |
+            
+            ---
+            
+            ### 🆕 NEW: Configuration File Support
+            
+            This build includes `vkd3d_proton.conf` - a configuration file similar to `dxvk.conf`!
+            
+            **Features:**
+            - Per-game settings using `[executable.exe]` sections
+            - Memory/VRAM override
+            - Feature toggles (Ray Tracing, Mesh Shaders, etc.)
+            - Performance tuning options
+            - Quick presets for different devices
+            
+            **Usage:**
+            1. Place `vkd3d_proton.conf` in game directory
+            2. Or set `VKD3D_CONFIG_FILE=/path/to/config`
+            3. Edit settings as needed
+            
+            ### 🔗 Source
+            https://github.com/HansKristian-Work/vkd3d-proton
+          draft: false
+          prerelease: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf src out pkg
+          echo "Cleanup completed"
