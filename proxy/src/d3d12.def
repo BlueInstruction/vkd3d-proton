@@ -1,3 +1,0 @@
-LIBRARY d3d12
-EXPORTS
-    D3D12CreateDevice @1
