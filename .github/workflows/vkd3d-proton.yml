@@ -1,11 +1,12 @@
-name: VKD3D-Proton
 
-on:
-  schedule:
-    - cron: "0 21 * * *"
-  workflow_dispatch:
+#name: VKD3D-Proton
+
+#on:
+#  schedule:
+#    - cron: "0 21 * * *"
+#  workflow_dispatch:
     inputs:
-      FORCE_MODE:
+#      FORCE_MODE:
         type: boolean
         default: false
       VERSION:
@@ -316,7 +317,7 @@ jobs:
           
           echo "Build verification passed"
 
-      - name: Prepare WCP Package
+#      - name: Prepare WCP Package
         if: steps.check.outputs.SKIP_RUN == 'false'
         run: |
           mkdir -p staging/system32 staging/syswow64
@@ -363,7 +364,7 @@ jobs:
           echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
           echo "Package created: ${PACKAGE_NAME}.wcp"
 
-      - name: Upload Artifact
+#      - name: Upload Artifact
         if: steps.check.outputs.SKIP_RUN == 'false'
         uses: actions/upload-artifact@v4
         with:
@@ -371,7 +372,7 @@ jobs:
           path: ${{ env.PACKAGE_NAME }}.wcp
           retention-days: 30
 
-      - name: Deploy Release
+  #    - name: Deploy Release
         if: steps.check.outputs.SKIP_RUN == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
