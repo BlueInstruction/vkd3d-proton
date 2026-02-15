@@ -860,7 +860,7 @@ static const struct vkd3d_shader_quirk_info death_stranding_quirks = {
 
 static const struct vkd3d_shader_quirk_hash wuthering_waves_hashes[] = {
     /* LightGridInjectionCS. Forgets to UAV barrier after ClearCS. */
-    { 0xc9d920e5cce36266, VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER },
+    { 0x3961a9adabf4e1e4, VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER },
 };
 
 static const struct vkd3d_shader_quirk_info wuthering_waves_quirks = {
@@ -2728,6 +2728,10 @@ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
     if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
         vulkan_info->EXT_vertex_attribute_divisor = false;
 
+    vulkan_info->supports_cubin_64bit = vulkan_info->NVX_binary_import && vulkan_info->NVX_image_view_handle &&
+            get_spec_version(vk_extensions, count, VK_NVX_BINARY_IMPORT_EXTENSION_NAME) >= 2 &&
+            get_spec_version(vk_extensions, count, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) >= 3;
+
     vkd3d_free(vk_extensions);
     return S_OK;
 }
@@ -4175,7 +4179,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
     }
 
     if (IsEqualGUID(riid, &IID_ID3D12DeviceExt)
-            || IsEqualGUID(riid, &IID_ID3D12DeviceExt1))
+            || IsEqualGUID(riid, &IID_ID3D12DeviceExt1)
+            || IsEqualGUID(riid, &IID_ID3D12DeviceExt2))
     {
         d3d12_device_vkd3d_ext_AddRef(&device->ID3D12DeviceExt_iface);
         *object = &device->ID3D12DeviceExt_iface;
@@ -4625,6 +4630,10 @@ bool d3d12_device_is_uma(struct d3d12_device *device, bool *coherent)
 
     for (i = 0; i < device->memory_properties.memoryTypeCount; ++i)
     {
+		/* Ignore these types. We never use them and they won't be HOST_VISIBLE. */
+		if (device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)
+			continue;
+
         if (!(device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
             return false;
         if (coherent && !(device->memory_properties.memoryTypes[i].propertyFlags
@@ -5255,9 +5264,18 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            /* Would require some sort of wine
-             * interop to support file handles */
+            /* Complete support would require some sort of wine
+             * interop to support file handles and kernels to deal with file mappings properly.
+             * We cannot easily query that here, but noone seems to rely on that particular feature.
+             * We support the simpler cases, however,
+             * and at least one ISV has asked for this to be exposed. */
+#ifdef _WIN32
+            data->Supported = device->vk_info.EXT_external_memory_host;
+#else
+            /* Cannot easily support this on native Linux since we don't have VirtualQuery() and friends.
+             * Not important enough to support to bother implementing it ourselves. */
             data->Supported = FALSE;
+#endif
 
             TRACE("Existing heaps %#x.\n", data->Supported);
             return S_OK;
@@ -7275,16 +7293,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineLibrary(d3d12_device
             flags, &pipeline_library)))
         return hr;
 
-    if (lib)
-    {
-        return return_interface(&pipeline_library->ID3D12PipelineLibrary_iface,
-                &IID_ID3D12PipelineLibrary, iid, lib);
-    }
-    else
-    {
-        ID3D12PipelineLibrary1_Release(&pipeline_library->ID3D12PipelineLibrary_iface);
-        return S_FALSE;
-    }
+    return return_interface(&pipeline_library->ID3D12PipelineLibrary_iface,
+            &IID_ID3D12PipelineLibrary, iid, lib);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_SetEventOnMultipleFenceCompletion(d3d12_device_iface *iface,
@@ -9960,7 +9970,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
     }
 }
 
-extern CONST_VTBL struct ID3D12DeviceExt1Vtbl d3d12_device_vkd3d_ext_vtbl;
+extern CONST_VTBL struct ID3D12DeviceExt2Vtbl d3d12_device_vkd3d_ext_vtbl;
 extern CONST_VTBL struct ID3D12DXVKInteropDevice2Vtbl d3d12_dxvk_interop_device_vtbl;
 extern CONST_VTBL struct ID3DLowLatencyDeviceVtbl d3d_low_latency_device_vtbl;
 extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
