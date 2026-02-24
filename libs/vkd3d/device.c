@@ -150,6 +150,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(NV_COOPERATIVE_MATRIX_2, NV_cooperative_matrix2),
     /* VALVE extensions */
     VK_EXTENSION(VALVE_MUTABLE_DESCRIPTOR_TYPE, VALVE_mutable_descriptor_type),
+    VK_EXTENSION(VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT, VALVE_shader_mixed_float_dot_product),
     /* MESA extensions */
     VK_EXTENSION(MESA_IMAGE_ALIGNMENT_CONTROL, MESA_image_alignment_control),
 };
@@ -731,6 +732,17 @@ static const struct vkd3d_shader_quirk_info re_quirks = {
     re_hashes, ARRAY_SIZE(re_hashes), 0,
 };
 
+/* Works around a weird GPU hang on RDNA4. See mesa issue https://gitlab.freedesktop.org/mesa/mesa/-/issues/14812.
+ * The game doesn't seem to actually write useful subsampling here anyway. */
+static const struct vkd3d_shader_quirk_info re2_quirks = {
+    re_hashes, ARRAY_SIZE(re_hashes), VKD3D_SHADER_QUIRK_IGNORE_PRIMITIVE_SHADING_RATE,
+};
+
+/* Works around the same weird GPU hang as above (RE2) but for RE8. */
+static const struct vkd3d_shader_quirk_info re8_quirks = {
+    re_hashes, ARRAY_SIZE(re_hashes), VKD3D_SHADER_QUIRK_IGNORE_PRIMITIVE_SHADING_RATE,
+};
+
 /* There are lots of shaders which cause random flicker due to bad 16-bit behavior.
  * These shaders really need 32-bit it seems to render properly, so just do that. */
 static const struct vkd3d_shader_quirk_info re4_quirks = {
@@ -914,7 +926,9 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Rise of the Ronin (1340990) */
     { VKD3D_STRING_COMPARE_EXACT, "Ronin.exe", &team_ninja_quirks },
     /* Resident Evil 2 (883710) */
-    { VKD3D_STRING_COMPARE_EXACT, "re2.exe", &re_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "re2.exe", &re2_quirks },
+    /* Resident Evil Village (1196590) */
+    { VKD3D_STRING_COMPARE_EXACT, "re8.exe", &re8_quirks },
     /* Resident Evil 7 (418370) */
     { VKD3D_STRING_COMPARE_EXACT, "re7.exe", &re_quirks },
     /* Resident Evil 4 (2050650) */
@@ -2266,6 +2280,13 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
     {
         info->unified_image_layouts_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR;
         vk_prepend_struct(&info->features2, &info->unified_image_layouts_features);
+    }
+
+    if (vulkan_info->VALVE_shader_mixed_float_dot_product)
+    {
+        info->shader_mixed_float_dot_product_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE;
+        vk_prepend_struct(&info->features2, &info->shader_mixed_float_dot_product_features);
     }
 
     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
@@ -4223,6 +4244,16 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
         return S_OK;
     }
 
+    if (IsEqualGUID(riid, &IID_ID3D12DeviceConfiguration) ||
+        IsEqualGUID(riid, &IID_ID3D12DeviceConfiguration1))
+    {
+        /* Unfortunately we cannot safely borrow from a ID3D12DeviceFactory pointer since
+         * tests prove refcounts have to work like COM expects, so need to duplicate stuff :( */
+        ID3D12DeviceConfiguration1_AddRef(&device->ID3D12DeviceConfiguration1_iface);
+        *object = &device->ID3D12DeviceConfiguration1_iface;
+        return S_OK;
+    }
+
     WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(riid));
 
     *object = NULL;
@@ -4242,6 +4273,17 @@ ULONG d3d12_device_release_common(struct d3d12_device *device)
 {
     ULONG cur_refcount, cas_refcount;
     bool is_locked = false;
+
+    if (device->independent_device)
+    {
+        cur_refcount = InterlockedDecrement(&device->refcount);
+        if (cur_refcount == 0)
+        {
+            d3d12_device_destroy(device);
+            vkd3d_free_aligned(device);
+        }
+        return cur_refcount;
+    }
 
     cur_refcount = 0;
     cas_refcount = vkd3d_atomic_uint32_load_explicit(&device->refcount, vkd3d_memory_order_relaxed);
@@ -8616,6 +8658,91 @@ VKD3D_DECLARE_D3D12_DEVICE_VARIANT(embedded_generic, embedded, embedded_generic)
 VKD3D_DECLARE_D3D12_DEVICE_VARIANT(descriptor_buffer_16_16_4, default, descriptor_buffer_16_16_4);
 VKD3D_DECLARE_D3D12_DEVICE_VARIANT(descriptor_buffer_64_64_32, default, descriptor_buffer_64_64_32);
 
+static struct d3d12_device *impl_from_ID3D12DeviceConfiguration1(ID3D12DeviceConfiguration1 *iface)
+{
+    if (!iface)
+        return NULL;
+    return CONTAINING_RECORD(iface, struct d3d12_device, ID3D12DeviceConfiguration1_iface);
+}
+
+static ULONG STDMETHODCALLTYPE d3d12_device_configuration_AddRef(ID3D12DeviceConfiguration1 *iface)
+{
+    struct d3d12_device *device = impl_from_ID3D12DeviceConfiguration1(iface);
+    return d3d12_device_add_ref_common(device);
+}
+
+static ULONG STDMETHODCALLTYPE d3d12_device_configuration_Release(ID3D12DeviceConfiguration1 *iface)
+{
+    struct d3d12_device *device = impl_from_ID3D12DeviceConfiguration1(iface);
+    return d3d12_device_release_common(device);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_configuration_QueryInterface(ID3D12DeviceConfiguration1 *iface,
+        REFIID iid, void **object)
+{
+    struct d3d12_device *device = impl_from_ID3D12DeviceConfiguration1(iface);
+    return d3d12_device_QueryInterface(&device->ID3D12Device_iface, iid, object);
+}
+
+static D3D12_DEVICE_CONFIGURATION_DESC * STDMETHODCALLTYPE d3d12_device_configuration_GetDesc(
+        ID3D12DeviceConfiguration1 *iface, D3D12_DEVICE_CONFIGURATION_DESC *desc)
+{
+    TRACE("iface %p\n", iface);
+    memset(desc, 0, sizeof(*desc));
+    desc->SDKVersion = D3D12_SDK_VERSION;
+    return desc;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_configuration_GetEnabledExperimentalFeatures(
+        ID3D12DeviceConfiguration1 *iface, GUID *pGuids, UINT NumGuids)
+{
+    FIXME("iface %p, pGuids %p, NumGuids %u stub!\n", iface, pGuids, NumGuids);
+    /* The spec doesn't say how this is supposed to work. We don't support experimental features anyway. */
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_configuration_SerializeVersionedRootSignature(
+        ID3D12DeviceConfiguration1 *iface, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *pDesc,
+        ID3DBlob **ppResult, ID3DBlob **ppError)
+{
+    TRACE("iface %p, pDesc %p, ppResult %p, ppError %p\n", iface, pDesc, ppResult, ppError);
+    return vkd3d_serialize_versioned_root_signature(pDesc, ppResult, ppError);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_configuration_CreateVersionedRootSignatureDeserializer(
+        ID3D12DeviceConfiguration1 *iface, const void *pBlob, SIZE_T Size,
+        REFIID iid, void **ppvDeserializer)
+{
+    TRACE("iface %p, pBlob %p, Size %zu, iid %s, ppvDeserializer %p\n",
+        iface, pBlob, Size, debugstr_guid(iid), ppvDeserializer);
+    return vkd3d_create_versioned_root_signature_deserializer(pBlob, Size, iid, ppvDeserializer);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_configuration_CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(
+        ID3D12DeviceConfiguration1 *iface, const void *pLibraryBlob, SIZE_T Size,
+        LPCWSTR RootSignatureSubobjectName, REFIID iid, void **ppvDeserializer)
+{
+    TRACE("iface %p, pLibraryBlob %p, Size %zu, RootSignatureSubobjectName %s, iid %s, ppvDeserializer %p\n",
+        iface, pLibraryBlob, Size, debugstr_w(RootSignatureSubobjectName), debugstr_guid(iid), ppvDeserializer);
+    return vkd3d_create_versioned_root_signature_deserializer_for_subobject(
+        pLibraryBlob, Size, RootSignatureSubobjectName, iid, ppvDeserializer);
+}
+
+static CONST_VTBL ID3D12DeviceConfiguration1Vtbl d3d12_device_configuration_vtbl =
+{
+    /* IUnknown methods */
+    d3d12_device_configuration_QueryInterface,
+    d3d12_device_configuration_AddRef,
+    d3d12_device_configuration_Release,
+    /* ID3D12DeviceConfiguration methods */
+    d3d12_device_configuration_GetDesc,
+    d3d12_device_configuration_GetEnabledExperimentalFeatures,
+    d3d12_device_configuration_SerializeVersionedRootSignature,
+    d3d12_device_configuration_CreateVersionedRootSignatureDeserializer,
+    /* ID3D12DeviceConfiguration1 methods */
+    d3d12_device_configuration_CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary,
+};
+
 #ifdef VKD3D_ENABLE_PROFILING
 #include "device_profiled.h"
 #endif
@@ -9829,6 +9956,12 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
         device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
                 VKD3D_SHADER_TARGET_EXTENSION_EXTENDED_NON_SEMANTIC;
     }
+
+    if (device->device_info.shader_mixed_float_dot_product_features.shaderMixedFloatDotProductFloat16AccFloat32)
+    {
+        device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
+                VKD3D_SHADER_TARGET_EXTENSION_MIXED_FLOAT_DOT_PRODUCT;
+    }
 }
 
 static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
@@ -10075,6 +10208,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     device->ID3D12DXVKInteropDevice_iface.lpVtbl = &d3d12_dxvk_interop_device_vtbl;
     device->ID3DLowLatencyDevice_iface.lpVtbl = &d3d_low_latency_device_vtbl;
     device->IAmdExtAntiLagApi_iface.lpVtbl = &d3d_amd_ext_anti_lag_vtbl;
+    device->ID3D12DeviceConfiguration1_iface.lpVtbl = &d3d12_device_configuration_vtbl;
 
     if ((rc = rwlock_init(&device->vertex_input_lock)))
     {
@@ -10374,17 +10508,57 @@ bool d3d12_device_validate_shader_meta(struct d3d12_device *device, const struct
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
         const struct vkd3d_device_create_info *create_info, struct d3d12_device **device)
 {
+    bool reject_existing_device = false;
+    bool forced_singletons = false;
     struct d3d12_device *object;
+    char env[64];
     HRESULT hr;
 
-    pthread_mutex_lock(&d3d12_device_map_mutex);
-    if ((object = d3d12_find_device_singleton(create_info->adapter_luid)))
+    if (create_info->independent)
     {
-        TRACE("Returned existing singleton device %p.\n", object);
+        /* RenderDoc does not support multiple VkDevices active.
+         * The independent devices APIs exposes this scenario. */
+        forced_singletons = vkd3d_get_env_var("ENABLE_VULKAN_RENDERDOC_CAPTURE", env, sizeof(env)) &&
+                strcmp(env, "1") == 0;
 
-        d3d12_device_add_ref(*device = object);
+        INFO("Forcing singleton device due to RenderDoc being enabled.\n");
+
+        if (forced_singletons &&
+            (create_info->device_factory_flags &
+                (D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_EXISTING_DEVICE |
+                 D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_INCOMPATIBLE_EXISTING_DEVICE)) == 0)
+        {
+            reject_existing_device = true;
+        }
+    }
+
+    pthread_mutex_lock(&d3d12_device_map_mutex);
+
+    if (!create_info->independent || forced_singletons)
+    {
+        if ((object = d3d12_find_device_singleton(create_info->adapter_luid)))
+        {
+            TRACE("Returned existing singleton device %p.\n", object);
+
+            if (reject_existing_device)
+            {
+                pthread_mutex_unlock(&d3d12_device_map_mutex);
+                INFO("Attempting to create a new independent device, but we're blocked by RenderDoc.\n");
+                return DXGI_ERROR_ALREADY_EXISTS;
+            }
+
+            d3d12_device_add_ref(*device = object);
+            pthread_mutex_unlock(&d3d12_device_map_mutex);
+            return S_OK;
+        }
+    }
+
+    if (forced_singletons &&
+        (create_info->device_factory_flags & D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON))
+    {
         pthread_mutex_unlock(&d3d12_device_map_mutex);
-        return S_OK;
+        INFO("Attempting to create a new independent device, but we must store as singleton due to RenderDoc.\n");
+        return DXGI_ERROR_UNSUPPORTED;
     }
 
     if (!(object = vkd3d_malloc_aligned(sizeof(*object), 64)))
@@ -10413,7 +10587,10 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
 
     TRACE("Created device %p (dummy d3d12_device_AddRef for debug grep purposes).\n", object);
 
-    d3d12_add_device_singleton(object, create_info->adapter_luid);
+    if (create_info->independent && !forced_singletons)
+        object->independent_device = true;
+    else
+        d3d12_add_device_singleton(object, create_info->adapter_luid);
 
     pthread_mutex_unlock(&d3d12_device_map_mutex);
 

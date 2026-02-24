@@ -207,6 +207,7 @@ struct vkd3d_vulkan_info
     bool NV_cooperative_matrix2;
     /* VALVE extensions */
     bool VALVE_mutable_descriptor_type;
+    bool VALVE_shader_mixed_float_dot_product;
     /* MESA extensions */
     bool MESA_image_alignment_control;
 
@@ -5030,6 +5031,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cooperative_matrix2_features_nv;
     VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_amd;
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_features;
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE shader_mixed_float_dot_product_features;
 
     VkPhysicalDeviceFeatures2 features2;
 
@@ -5391,6 +5393,7 @@ struct d3d12_device
     d3d12_dxvk_interop_device_iface ID3D12DXVKInteropDevice_iface;
     d3d_low_latency_device_iface ID3DLowLatencyDevice_iface;
     IAmdExtAntiLagApi IAmdExtAntiLagApi_iface;
+    ID3D12DeviceConfiguration1 ID3D12DeviceConfiguration1_iface;
     LONG refcount;
 
     VkDevice vk_device;
@@ -5493,6 +5496,8 @@ struct d3d12_device
         HMODULE amdxc64;
     } vendor_hacks;
 #endif
+
+    bool independent_device;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
