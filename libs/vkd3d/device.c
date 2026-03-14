@@ -455,6 +455,8 @@ bool vkd3d_debug_control_mute_message_id(const char *vuid);
 bool vkd3d_debug_control_is_test_suite(void);
 bool vkd3d_debug_control_explode_on_vvl_error(void);
 
+static uint32_t vkd3d_vvl_debug_sentinel_error_count;
+
 static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
         VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
         VkDebugUtilsMessageTypeFlagsEXT message_types,
@@ -466,8 +468,17 @@ static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
     if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
         if (callback_data->pMessageIdName)
+        {
+            /* Sentinel to check if validation is loaded properly. */
+            if (strcmp(callback_data->pMessageIdName, "VUID-VkDebugUtilsMessengerCallbackDataEXT-pNext-pNext") == 0)
+            {
+                vkd3d_atomic_uint32_increment(&vkd3d_vvl_debug_sentinel_error_count, vkd3d_memory_order_relaxed);
+                return VK_TRUE;
+            }
+
             if (vkd3d_debug_control_mute_message_id(callback_data->pMessageIdName))
                 return VK_FALSE;
+        }
 
         ERR("%s: %s\n", callback_data->pMessageIdName, callback_data->pMessage);
 
@@ -486,6 +497,8 @@ static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
     }
     else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
         WARN("%s\n", callback_data->pMessage);
+    else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
+        INFO("%s\n", callback_data->pMessage);
 
     (void)userdata;
     (void)message_types;
@@ -495,15 +508,19 @@ static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
 static void vkd3d_init_debug_messenger_callback(struct vkd3d_instance *instance)
 {
     const struct vkd3d_vk_instance_procs *vk_procs = &instance->vk_procs;
+    VkDebugUtilsMessengerCallbackDataEXT callback_data;
     VkDebugUtilsMessengerCreateInfoEXT callback_info;
     VkInstance vk_instance = instance->vk_instance;
     VkDebugUtilsMessengerEXT callback;
+    uint32_t old_count, new_count;
+    VkBaseInStructure dummy_pnext;
     VkResult vr;
 
     callback_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
     callback_info.pNext = NULL;
     callback_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
-                                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
     callback_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
     callback_info.pfnUserCallback = vkd3d_debug_messenger_callback;
     callback_info.pUserData = NULL;
@@ -512,6 +529,35 @@ static void vkd3d_init_debug_messenger_callback(struct vkd3d_instance *instance)
     {
         WARN("Failed to create debug report callback, vr %d.\n", vr);
         return;
+    }
+
+    memset(&dummy_pnext, 0, sizeof(dummy_pnext));
+    dummy_pnext.sType = VK_STRUCTURE_TYPE_MAX_ENUM;
+
+    memset(&callback_data, 0, sizeof(callback_data));
+    callback_data.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT;
+    callback_data.flags = 0;
+    callback_data.pMessage = "Self-inserted message to check if we're getting messages. "
+            "This should be skipped if VVL is working as intended.";
+    callback_data.pNext = &dummy_pnext; /* Pass in benign pnext that we expect VVL to catch if it's working. */
+
+    INFO("Attempting to send invalid call to VVL to verify that it's active ...\n");
+
+    old_count = vkd3d_atomic_uint32_load_explicit(&vkd3d_vvl_debug_sentinel_error_count, vkd3d_memory_order_relaxed);
+    VK_CALL(vkSubmitDebugUtilsMessageEXT(vk_instance, VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
+            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &callback_data));
+    new_count = vkd3d_atomic_uint32_load_explicit(&vkd3d_vvl_debug_sentinel_error_count, vkd3d_memory_order_relaxed);
+
+    if (old_count != new_count)
+    {
+        INFO("Validation layers seem to be loaded correctly.\n");
+    }
+    else
+    {
+        ERR("Validation layers do not seem to be loaded correctly.\n"
+            "When vkd3d-proton is run through Wine/Proton, help from environment variables is required.\n"
+            "Use VKD3D_CONFIG=vk_debug VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation instead!\n"
+            "If this still does not work, VK_LOADER_DEBUG=layer can be used to debug why it's not loaded.\n");
     }
 
     instance->vk_debug_callback = callback;
@@ -598,8 +644,6 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "AOW4.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
     /* Red Dead Redemption (2668510). Inconsistent performance with ReBAR at cutscenes of the game. */
     { VKD3D_STRING_COMPARE_EXACT, "RDR.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
-    /* Horizon Forbidden West (2420110). Work around RADV 23.3.1 that ships on stableOS at time of making WAR. */
-    { VKD3D_STRING_COMPARE_EXACT, "HorizonForbiddenWest.exe", VKD3D_CONFIG_FLAG_DRIVER_VERSION_SENSITIVE_SHADERS, 0 },
     /* Starfield (1716740) */
     { VKD3D_STRING_COMPARE_EXACT, "Starfield.exe",
             VKD3D_CONFIG_FLAG_REQUIRES_COMPUTE_INDIRECT_TEMPLATES | VKD3D_CONFIG_FLAG_REJECT_PADDED_SMALL_RESOURCE_ALIGNMENT, 0 },
@@ -630,6 +674,11 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "ff7rebirth_.exe",
             VKD3D_CONFIG_FLAG_RETAIN_PSOS | VKD3D_CONFIG_FLAG_NO_STAGGERED_SUBMIT, 0,
             VKD3D_APPLICATION_FEATURE_MESH_SHADER_WITHOUT_BARYCENTRICS },
+    /* REANIMAL (2129530). Game can destroy PSOs while they are in-flight on loading screen.
+     * Smells very similar to FFVII Rebirth.
+     * It also has bugs with FSR3 being destroyed while in flight (but that case is automatically covered already). */
+    { VKD3D_STRING_COMPARE_EXACT, "REANIMAL.exe",
+            VKD3D_CONFIG_FLAG_RETAIN_PSOS | VKD3D_CONFIG_FLAG_NO_STAGGERED_SUBMIT, 0 },
     /* There aren't many games that use mesh shaders outside of UE5 Nanite fallbacks.
      * UE5 is broken w.r.t. feature checks, so we have to do opt-in instead :( */
     { VKD3D_STRING_COMPARE_EXACT, "AlanWake2.exe", 0, 0, VKD3D_APPLICATION_FEATURE_MESH_SHADER_WITHOUT_BARYCENTRICS },
@@ -903,6 +952,15 @@ static const struct vkd3d_shader_quirk_info rottr_quirks = {
     rottr_hashes, ARRAY_SIZE(rottr_hashes), 0,
 };
 
+static const struct vkd3d_shader_quirk_hash hfw_hashes[] = {
+    /* Classic case of a clear CS that is followed up by overwriting it without proper barrier. */
+    { 0x548a3de5dc3828ef, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER },
+};
+
+static const struct vkd3d_shader_quirk_info hfw_quirks = {
+    hfw_hashes, ARRAY_SIZE(hfw_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* F1 2020 (1080110) */
     { VKD3D_STRING_COMPARE_EXACT, "F1_2020_dx12.exe", &f1_2019_2020_quirks },
@@ -973,6 +1031,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Control_DX12.exe", &control_quirks },
 	/* Rise of the Tomb Raider */
     { VKD3D_STRING_COMPARE_EXACT, "ROTTR.exe", &rottr_quirks },
+    /* Horizon Forbidden West (2420110). */
+    { VKD3D_STRING_COMPARE_EXACT, "HorizonForbiddenWest.exe", &hfw_quirks },
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
     /* MSVC fails to compile empty array. */
@@ -1187,6 +1247,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"small_vram_rebar", VKD3D_CONFIG_FLAG_SMALL_VRAM_REBAR},
     {"no_staggered_submit", VKD3D_CONFIG_FLAG_NO_STAGGERED_SUBMIT},
     {"no_clear_uav_sync", VKD3D_CONFIG_FLAG_NO_CLEAR_UAV_SYNC},
+    {"retain_psos", VKD3D_CONFIG_FLAG_RETAIN_PSOS},
     {"force_dynamic_msaa", VKD3D_CONFIG_FLAG_FORCE_DYNAMIC_MSAA},
     {"instruction_qa_checks", VKD3D_CONFIG_FLAG_INSTRUCTION_QA_CHECKS},
     {"transfer_queue", VKD3D_CONFIG_FLAG_TRANSFER_QUEUE},
@@ -1354,11 +1415,6 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
             }
         }
 
-        if (instance_info.enabledLayerCount == 0)
-        {
-            ERR("Failed to enumerate instance layers, will not use VK_LAYER_KHRONOS_validation directly.\n"
-                "Use VKD3D_CONFIG=vk_debug VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation instead!\n");
-        }
         vkd3d_free(layers);
     }
 
@@ -9859,6 +9915,12 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
             compute_derivative_ext = VKD3D_SHADER_TARGET_EXTENSION_COMPUTE_SHADER_DERIVATIVES_KHR;
 
         device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] = compute_derivative_ext;
+
+        if (device->device_info.compute_shader_derivatives_features_khr.computeDerivativeGroupQuads)
+        {
+            device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
+                VKD3D_SHADER_TARGET_EXTENSION_COMPUTE_SHADER_DERIVATIVES_QUAD;
+        }
     }
 
     if (device->d3d12_caps.options4.Native16BitShaderOpsSupported)
